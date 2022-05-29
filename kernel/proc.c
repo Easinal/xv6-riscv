@@ -25,27 +25,7 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
-static int default_ticket = 10;
-static int stride1 = 100000;
-#define PASS_THRESHOLE 1000000000
-#ifdef LOTTERY
-static int total_tickets = 0;
-unsigned short lfsr = 0xACE1u;
-unsigned short bit;
-unsigned short rand()
-{
-bit = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
-return lfsr = (lfsr >> 1) | (bit << 15);
-}
-#endif
-#ifdef LOTTERY
-int print_sched_statistics(void);
-int sched_tickets(int n);
-#endif
-#ifdef STRIDE
-int print_sched_statistics(void);
-int sched_tickets(int n);
-#endif
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -138,11 +118,10 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->tid = 0;
+  p->counter = 0;
   p->state = USED;
-  p->tickets = default_ticket;
-  p->ticks = 0;
-  p->stride = stride1/default_ticket;
-  p->pass = 0;
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -167,6 +146,43 @@ found:
   return p;
 }
 
+static struct proc*
+allocproc_thread(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->tid = 0;
+  p->counter = 0;
+  p->state = USED;
+
+  // Allocate a trapframe page.
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  return p;
+}
+
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -176,9 +192,11 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
-  p->pagetable = 0;
+  if(p->pid==0){
+	  if(p->pagetable)
+		proc_freepagetable(p->pagetable, p->sz);
+	  p->pagetable = 0;
+  }
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -366,21 +384,21 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+  if(p->tid == 0){
+	  // Close all open files.
+	  for(int fd = 0; fd < NOFILE; fd++){
+		if(p->ofile[fd]){
+		  struct file *f = p->ofile[fd];
+		  fileclose(f);
+		  p->ofile[fd] = 0;
+		}
+	  }
 
-  // Close all open files.
-  for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd]){
-      struct file *f = p->ofile[fd];
-      fileclose(f);
-      p->ofile[fd] = 0;
-    }
+	  begin_op();
+	  iput(p->cwd);
+	  end_op();
+	  p->cwd = 0;
   }
-
-  begin_op();
-  iput(p->cwd);
-  end_op();
-  p->cwd = 0;
-
   acquire(&wait_lock);
 
   // Give any children to init.
@@ -428,7 +446,7 @@ wait(uint64 addr)
                                   sizeof(np->xstate)) < 0) {
             release(&np->lock);
             release(&wait_lock);
-            return -1;
+            return -2;
           }
           freeproc(np);
           release(&np->lock);
@@ -467,63 +485,7 @@ scheduler(void)
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-	#ifdef LOTTERY
-	total_tickets = 0;
-    for(p = proc; p < &proc[NPROC]; p++) 
-    {
-	  //if(p->tickets == default_ticket) continue;
-      //if((p->state != RUNNABLE) && (p->state != RUNNING))continue;
-      acquire(&p->lock);
-      if(((p->state == RUNNABLE) || (p->state == RUNNING))){
-        total_tickets += p->tickets;
-      }
-      release(&p->lock);
-    }
-    //printf("total_ticket=%d\n", total_tickets);
-    int winner_ticket = rand()%total_tickets + 1;
-    //printf("winner_ticket=%d\n", winner_ticket);
-    int counter = 0;
-    for(p = proc; p < &proc[NPROC]; p++) 
-    {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE){
-        counter+=p->tickets;
-        if(counter>=winner_ticket){
-          //printf("counter=%d\n", counter);
-          p->state = RUNNING;
-          c->proc = p;
-          p->ticks +=1;
-          swtch(&c->context, &p->context);
-          c->proc = 0;
-          //printf("%d(%s): tickets: %d, ticks: %d\n", p->pid,p->name,p->tickets,p->ticks);
-          release(&p->lock);
-          break;
-        }
-      }
-      release(&p->lock);
-    }
-	#elif STRIDE
-    struct proc *p_select = 0;
-    int cur_min_pass = 1000000000; 
-    for(p = proc; p < &proc[NPROC]; p++){
-      acquire(&p->lock);
-      if (p->state == RUNNABLE && p->pass < cur_min_pass){
-        cur_min_pass = p->pass;
-        p_select = p;
-      }
-      release(&p->lock);
-    }
-    if (p_select != 0) {
-      acquire(&p_select->lock);
-      p_select->pass += p_select->stride;
-      p_select->state = RUNNING;
-      c->proc = p_select;
-      p_select->ticks +=1;
-      swtch(&c->context, &p_select->context);
-      c->proc = 0;
-      release(&p_select->lock);
-    }
-	#else
+
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
@@ -532,7 +494,6 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
-		p->ticks++;
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -541,9 +502,7 @@ scheduler(void)
       }
       release(&p->lock);
     }
-	#endif
   }
-  
 }
 
 // Switch to scheduler.  Must hold only p->lock
@@ -737,26 +696,64 @@ procdump(void)
   }
 }
 
-void print_hello(int n){
-	printf("Hello from the kernel space %d\n", n);
-}
-
-int print_sched_statistics(void){
-  struct proc *p;
-  for(p = proc; p < &proc[NPROC]; p++) {
-    if(p->state == UNUSED) 
-      continue;  
-    printf("%d(%s): tickets: %d, ticks: %d\n", p->pid,p->name,p->tickets,p->ticks);
-  }
-	return 0;
-}
-
-int sched_tickets(int n){
-	struct proc *p = myproc();
+int
+clone(void* stack)
+{
 	
-	p->tickets = n;
-	p->ticks = 0;
-	p->stride = stride1/n;
-	p->pass = stride1/n;
-	return 0;
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if((np = allocproc_thread()) == 0){
+    return -1;
+  }
+
+  // Copy user memory from parent to child.
+  /* 
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  } */
+  np->pagetable = p->pagetable;
+  np->sz = p->sz;
+  np->tid = ++p->counter;
+
+  //np->trapframe = p->trapframe-np->tid*PGSIZE;
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+  np->trapframe->sp = (uint64)stack;
+  //np->context.sp = p->kstack + PGSIZE;
+  
+  if(mappages(np->pagetable, TRAPFRAME-np->tid*PGSIZE, PGSIZE,
+     (uint64)(np->trapframe), PTE_R | PTE_W) < 0){
+	panic("mappages error in clone");
+  }
+  
+
+  // increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
 }

@@ -118,6 +118,8 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->tid = 0;
+  p->counter = 0;
   p->state = USED;
 
   // Allocate a trapframe page.
@@ -144,6 +146,43 @@ found:
   return p;
 }
 
+static struct proc*
+allocproc_thread(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->tid = 0;
+  p->counter = 0;
+  p->state = USED;
+
+  // Allocate a trapframe page.
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  return p;
+}
+
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -153,9 +192,11 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
-  p->pagetable = 0;
+  if(p->pid==0){
+	  if(p->pagetable)
+		proc_freepagetable(p->pagetable, p->sz);
+	  p->pagetable = 0;
+  }
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -343,21 +384,21 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+  if(p->tid == 0){
+	  // Close all open files.
+	  for(int fd = 0; fd < NOFILE; fd++){
+		if(p->ofile[fd]){
+		  struct file *f = p->ofile[fd];
+		  fileclose(f);
+		  p->ofile[fd] = 0;
+		}
+	  }
 
-  // Close all open files.
-  for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd]){
-      struct file *f = p->ofile[fd];
-      fileclose(f);
-      p->ofile[fd] = 0;
-    }
+	  begin_op();
+	  iput(p->cwd);
+	  end_op();
+	  p->cwd = 0;
   }
-
-  begin_op();
-  iput(p->cwd);
-  end_op();
-  p->cwd = 0;
-
   acquire(&wait_lock);
 
   // Give any children to init.
@@ -405,7 +446,7 @@ wait(uint64 addr)
                                   sizeof(np->xstate)) < 0) {
             release(&np->lock);
             release(&wait_lock);
-            return -1;
+            return -2;
           }
           freeproc(np);
           release(&np->lock);
@@ -655,7 +696,66 @@ procdump(void)
   }
 }
 
-void
-print_hello(int n){
-	printf("Hello from the kernel space %d\n", n);
+int
+clone(void* stack)
+{
+	
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if((np = allocproc_thread()) == 0){
+    return -1;
+  }
+
+  // Copy user memory from parent to child.
+  /* 
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  } */
+  np->pagetable = p->pagetable;
+  np->sz = p->sz;
+  np->tid = ++p->counter;
+
+  //np->trapframe = p->trapframe-np->tid*PGSIZE;
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+  np->trapframe->sp = (uint64)stack;
+  //np->context.sp = p->kstack + PGSIZE;
+  
+  if(mappages(np->pagetable, TRAPFRAME-np->tid*PGSIZE, PGSIZE,
+     (uint64)(np->trapframe), PTE_R | PTE_W) < 0){
+    uvmunmap(np->pagetable, TRAMPOLINE, 1, 0);
+    uvmfree(np->pagetable, 0);
+    return 0;
+  }
+  
+
+  // increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
 }

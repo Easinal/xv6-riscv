@@ -96,24 +96,12 @@ sys_uptime(void)
   return xticks;
 }
 
-uint64 sys_hello(void)
+uint64
+sys_clone(void)
 {
-  int n;
-  argint(0, &n);
-  print_hello(n);
-  return 0;
-}
-
-uint64 sys_sched_statistics(void)
-{
-  print_sched_statistics();
-  return 0;
-}
-
-uint64 sys_sched_tickets(void)
-{
-  int n;
-  argint(0, &n);
-  sched_tickets(n);
-  return 0;
+  uint64 stack;
+  if(argaddr(0, &stack) < 0)
+    return -1;
+  int ret = clone((void *)stack);
+  return ret;
 }
