@@ -168,6 +168,7 @@ found:
   p->state = USED;
 
   // Allocate a trapframe page.
+  
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
     release(&p->lock);
@@ -192,13 +193,19 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pid==0){
-	  if(p->pagetable)
-		proc_freepagetable(p->pagetable, p->sz);
-	  p->pagetable = 0;
+  if(p->tid==0){
+	if(p->pagetable)
+	  proc_freepagetable(p->pagetable, p->sz);
+  }else{
+	if(p->pagetable){	
+	  uvmunmap(p->pagetable, TRAPFRAME-p->tid*PGSIZE, 1, 0);
+	}
   }
+  p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
+  p->tid = 0;
+  p->counter = 0;
   p->parent = 0;
   p->name[0] = 0;
   p->chan = 0;
@@ -384,7 +391,7 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
-  if(p->tid == 0){
+  if(p->tid == 0){              // lab3 only the tid of process is 0, so that when p->tid == 0, the process is exiting
 	  // Close all open files.
 	  for(int fd = 0; fd < NOFILE; fd++){
 		if(p->ofile[fd]){
@@ -725,11 +732,11 @@ clone(void* stack)
   *(np->trapframe) = *(p->trapframe);
 
   // Cause fork to return 0 in the child.
-  np->trapframe->a0 = 0;
+  np->trapframe->a0 = 0;                 // lab3 returns 0 to the new thread 
   np->trapframe->sp = (uint64)stack;
   //np->context.sp = p->kstack + PGSIZE;
   
-  if(mappages(np->pagetable, TRAPFRAME-np->tid*PGSIZE, PGSIZE,
+  if(mappages(p->pagetable, TRAPFRAME-np->tid*PGSIZE, PGSIZE,
      (uint64)(np->trapframe), PTE_R | PTE_W) < 0){
 	panic("mappages error in clone");
   }
@@ -738,8 +745,9 @@ clone(void* stack)
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
-      np->ofile[i] = filedup(p->ofile[i]);
-  np->cwd = idup(p->cwd);
+		np->ofile[i] = p->ofile[i];
+  np->cwd = p->cwd;
+  
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -755,5 +763,5 @@ clone(void* stack)
   np->state = RUNNABLE;
   release(&np->lock);
 
-  return pid;
+  return pid;     // lab3 returns the PID of the child to the parent
 }
